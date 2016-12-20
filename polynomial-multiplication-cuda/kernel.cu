@@ -3,119 +3,188 @@
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
+#include <math.h>
+#include <stdlib.h>
+#include <time.h>
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
+void multiplyWithCuda(long *c, const long *a, const long *b, unsigned int size);
+void multiplyWithCudaKaratsuba(long *c, const long *a, const long *b, unsigned int size);
 
-__global__ void addKernel(int *c, const int *a, const int *b)
+__device__ void multiplyKernelKaratsubaRec(long *z, const long *x, const long *y, unsigned int size)
+{
+	const long *a, *b, *c, *d;
+	long *ab, *ac;
+	long *bd, *cd;
+	long *adbc;
+
+
+	if (size <= 1)
+	{
+		z[0] = x[0] * y[0];
+	}
+	else
+	{
+		int half = (int)size / 2;
+
+		ab = (long*)malloc(half * sizeof(long));
+		ac = (long*)malloc(half * sizeof(long));
+		cd = (long*)malloc(half * sizeof(long));
+		bd = (long*)malloc(half * sizeof(long));
+		adbc = (long*)malloc(half * sizeof(long));
+
+		a = x;
+		b = x + half;
+
+		c = y;
+		d = y + half;
+
+		multiplyKernelKaratsubaRec(ac, a, c, half);
+		multiplyKernelKaratsubaRec(bd, b, d, size - half);
+
+		int i = 0;
+		for (i = 0; i < half; i++)
+		{
+			ab[i] = a[i] + b[i];
+			cd[i] = c[i] + d[i];
+		}
+
+		multiplyKernelKaratsubaRec(adbc, ab, cd, half);
+
+		for (i = 0; i < half; i++)
+		{
+			z[i] = adbc[i] - ac[i] - bd[i];
+		}
+	}
+}
+
+__global__ void multiplyKernelKaratsuba(long *z, const long *x, const long *y, unsigned int size)
+{
+	multiplyKernelKaratsubaRec(z, x, y, size);
+}
+
+__global__ void multiplyKernel(long *c, const long *a, const long *b, unsigned int size)
 {
     int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+	c[i] = 0;
+	for (auto x = 0; x < size; x++)
+    {
+	    for (auto y = 0; y < size; y++)
+	    {
+		    if (x + y == i)
+		    {
+				c[i] += a[x] * b[y];
+		    }
+	    }
+    }
 }
 
 int main()
 {
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
+	srand(time(nullptr));
+	
+	const auto arraySize = 512;
+	long a[arraySize];
+	long b[arraySize];
+	long c[2 * arraySize];
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
+	for (auto i = 0; i < arraySize; i++)
+	{
+		a[i] = rand() % 100;
+		b[i] = rand() % 100;
+		c[i] = c[arraySize + i] = 0;
+	}
 
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
+    // Multiply polynomials in parallel.
+	time_t timeStart;
+	time_t timeEnd;
+	time(&timeStart);
+	for (auto i = 0; i < 100; i++)
+		multiplyWithCuda(c, a, b, arraySize);
+	time(&timeEnd);
 
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
+	printf("time taken (normal) : %lld (%lld : %lld) \n", timeEnd - timeStart, timeStart, timeEnd);
+
+	time(&timeStart);
+	for (auto i = 0; i < 100; i++)
+		multiplyWithCudaKaratsuba(c, a, b, arraySize);
+	time(&timeEnd);
+
+	printf("time taken (karatsuba) : %lld (%lld : %lld) \n", timeEnd - timeStart, timeStart, timeEnd);
+
+
+//	for (auto i = 0; i < arraySize; i++)
+//	{
+//		printf("%d ", a[i]);
+//	}
+//	printf("\n");
+//
+//	for (auto i = 0; i < arraySize; i++)
+//	{
+//		printf("%d ", b[i]);
+//	}
+//	printf("\n");
+//
+//    for (auto i = 0; i < 2 * arraySize; i++)
+//    {
+//		printf("%d ", c[i]);
+//    }
+//	printf("\n");
+
+    cudaDeviceReset();
 
     return 0;
 }
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
+void multiplyWithCudaKaratsuba(long *c, const long *a, const long *b, unsigned int size)
 {
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
+	long *dev_a = nullptr;
+	long *dev_b = nullptr;
+	long *dev_c = nullptr;
 
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
+	cudaSetDevice(0);
 
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	cudaMalloc(&dev_c, 2 * size * sizeof(long));
+	cudaMalloc(&dev_a, size * sizeof(long));
+	cudaMalloc(&dev_b, size * sizeof(long));
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	cudaMemcpy(dev_a, a, size * sizeof(long), cudaMemcpyHostToDevice);
+	cudaMemcpy(dev_b, b, size * sizeof(long), cudaMemcpyHostToDevice);
 
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
+	int thread_num = 2 * size;
+	multiplyKernelKaratsuba <<<1, thread_num >>> (dev_c, dev_a, dev_b, size);
 
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	cudaDeviceSynchronize();
 
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	cudaMemcpy(c, dev_c, 2 * size * sizeof(long), cudaMemcpyDeviceToHost);
 
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
+	cudaFree(dev_c);
+	cudaFree(dev_a);
+	cudaFree(dev_b);
+}
 
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
+void multiplyWithCuda(long *c, const long *a, const long *b, unsigned int size)
+{
+    long *dev_a = nullptr;
+    long *dev_b = nullptr;
+    long *dev_c = nullptr;
+
+    cudaSetDevice(0);
+
+    cudaMalloc(&dev_c, 2 * size * sizeof(long));
+    cudaMalloc(&dev_a, size * sizeof(long));
+    cudaMalloc(&dev_b, size * sizeof(long));
     
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
+	cudaMemcpy(dev_a, a, size * sizeof(long), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_b, b, size * sizeof(long), cudaMemcpyHostToDevice);
 
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
+	int thread_num = 2 * size;
+    multiplyKernel<<<1, thread_num>>>(dev_c, dev_a, dev_b, size);
+    
+    cudaDeviceSynchronize();
 
-Error:
+    cudaMemcpy(c, dev_c, 2 * size * sizeof(long), cudaMemcpyDeviceToHost);
+
     cudaFree(dev_c);
     cudaFree(dev_a);
     cudaFree(dev_b);
-    
-    return cudaStatus;
 }
